@@ -37,10 +37,6 @@ class AdapterTestSQLServer < ActiveRecord::TestCase
     assert_equal 'SQLServer', connection.adapter_name
   end
 
-  it 'supports migrations' do
-    assert connection.supports_migrations?
-  end
-
   it 'support DDL in transactions' do
     assert connection.supports_ddl_transactions?
   end
@@ -144,12 +140,12 @@ class AdapterTestSQLServer < ActiveRecord::TestCase
     end
 
     it 'return quoted table_name to #query_requires_identity_insert? when INSERT sql contains id column' do
-      assert_equal '[funny_jokes]', connection.send(:query_requires_identity_insert?,@identity_insert_sql)
-      assert_equal '[funny_jokes]', connection.send(:query_requires_identity_insert?,@identity_insert_sql_unquoted)
-      assert_equal '[funny_jokes]', connection.send(:query_requires_identity_insert?,@identity_insert_sql_unordered)
-      assert_equal '[funny_jokes]', connection.send(:query_requires_identity_insert?,@identity_insert_sql_sp)
-      assert_equal '[funny_jokes]', connection.send(:query_requires_identity_insert?,@identity_insert_sql_unquoted_sp)
-      assert_equal '[funny_jokes]', connection.send(:query_requires_identity_insert?,@identity_insert_sql_unordered_sp)
+      assert_equal 'funny_jokes', connection.send(:query_requires_identity_insert?,@identity_insert_sql)
+      assert_equal 'funny_jokes', connection.send(:query_requires_identity_insert?,@identity_insert_sql_unquoted)
+      assert_equal 'funny_jokes', connection.send(:query_requires_identity_insert?,@identity_insert_sql_unordered)
+      assert_equal 'funny_jokes', connection.send(:query_requires_identity_insert?,@identity_insert_sql_sp)
+      assert_equal 'funny_jokes', connection.send(:query_requires_identity_insert?,@identity_insert_sql_unquoted_sp)
+      assert_equal 'funny_jokes', connection.send(:query_requires_identity_insert?,@identity_insert_sql_unordered_sp)
     end
 
     it 'return false to #query_requires_identity_insert? for normal SQL' do
@@ -235,6 +231,11 @@ class AdapterTestSQLServer < ActiveRecord::TestCase
       end
     end
 
+    it 'not disable referential integrity for the same table twice' do
+      tables = SSTestHasPk.connection.tables_with_referential_integrity
+      assert_equal tables.size, tables.uniq.size
+    end
+
   end
 
   describe 'database statements' do
@@ -265,42 +266,27 @@ class AdapterTestSQLServer < ActiveRecord::TestCase
     end
 
     it 'create integers when limit is 4' do
-      assert_equal 'integer', connection.type_to_sql(:integer, 4)
+      assert_equal 'integer', connection.type_to_sql(:integer, limit: 4)
     end
 
     it 'create integers when limit is 3' do
-      assert_equal 'integer', connection.type_to_sql(:integer, 3)
+      assert_equal 'integer', connection.type_to_sql(:integer, limit: 3)
     end
 
     it 'create smallints when limit is less than 3' do
-      assert_equal 'smallint', connection.type_to_sql(:integer, 2)
-      assert_equal 'smallint', connection.type_to_sql(:integer, 1)
+      assert_equal 'smallint', connection.type_to_sql(:integer, limit: 2)
+      assert_equal 'smallint', connection.type_to_sql(:integer, limit: 1)
     end
 
     it 'create bigints when limit is greateer than 4' do
-      assert_equal 'bigint', connection.type_to_sql(:integer, 5)
-      assert_equal 'bigint', connection.type_to_sql(:integer, 6)
-      assert_equal 'bigint', connection.type_to_sql(:integer, 7)
-      assert_equal 'bigint', connection.type_to_sql(:integer, 8)
+      assert_equal 'bigint', connection.type_to_sql(:integer, limit: 5)
+      assert_equal 'bigint', connection.type_to_sql(:integer, limit: 6)
+      assert_equal 'bigint', connection.type_to_sql(:integer, limit: 7)
+      assert_equal 'bigint', connection.type_to_sql(:integer, limit: 8)
     end
 
     it 'create floats when no limit supplied' do
       assert_equal 'float', connection.type_to_sql(:float)
-    end
-
-  end
-
-  describe 'indexes' do
-
-    let(:desc_index_name) { 'idx_credit_limit_test_desc' }
-
-    it 'have indexes with descending order' do
-      begin
-        connection.execute "CREATE INDEX [#{desc_index_name}] ON [accounts] (credit_limit DESC)"
-        assert connection.indexes('accounts').find { |i| i.name == desc_index_name }
-      ensure
-        connection.execute "DROP INDEX [#{desc_index_name}] ON [accounts]"
-      end
     end
 
   end
@@ -429,6 +415,15 @@ class AdapterTestSQLServer < ActiveRecord::TestCase
       assert_equal false, connection.database_prefix_remote_server?
     end
 
+  end
+
+  it 'in_memory_oltp' do
+    if ENV['IN_MEMORY_OLTP'] && connection.supports_in_memory_oltp?
+      SSTMemory.primary_key.must_equal 'id'
+      SSTMemory.columns_hash['id'].must_be :is_identity?
+    else
+      skip 'supports_in_memory_oltp? => false'
+    end
   end
 
 end

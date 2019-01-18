@@ -7,57 +7,58 @@ module ActiveRecord
           @native_database_types ||= initialize_native_database_types.freeze
         end
 
-        def tables(name = nil)
-          ActiveSupport::Deprecation.warn 'Passing arguments to #tables is deprecated without replacement.' if name
-          tables_sql('BASE TABLE')
-        end
-
-        def table_exists?(table_name)
-          ActiveSupport::Deprecation.warn(<<-MSG.squish)
-            #table_exists? currently checks both tables and views.
-            This behavior is deprecated and will be changed with Rails 5.1 to only check tables.
-            Use #data_source_exists? instead.
-          MSG
-          data_source_exists?(table_name)
-        end
-
-        def data_source_exists?(table_name)
-          return false if table_name.blank?
-          unquoted_table_name = SQLServer::Utils.extract_identifiers(table_name).object
-          super(unquoted_table_name)
-        end
-
-        def views
-          tables_sql('VIEW')
-        end
-
-        def view_exists?(table_name)
-          identifier = SQLServer::Utils.extract_identifiers(table_name)
-          super(identifier.object)
-        end
-
         def create_table(table_name, comment: nil, **options)
           res = super
           clear_cache!
           res
         end
 
-        def indexes(table_name, name = nil)
-          data = select("EXEC sp_helpindex #{quote(table_name)}", name) rescue []
+        def drop_table(table_name, options = {})
+          # Mimic CASCADE option as best we can.
+          if options[:force] == :cascade
+            execute_procedure(:sp_fkeys, pktable_name: table_name).each do |fkdata|
+              fktable = fkdata['FKTABLE_NAME']
+              fkcolmn = fkdata['FKCOLUMN_NAME']
+              pktable = fkdata['PKTABLE_NAME']
+              pkcolmn = fkdata['PKCOLUMN_NAME']
+              remove_foreign_key fktable, name: fkdata['FK_NAME']
+              do_execute "DELETE FROM #{quote_table_name(fktable)} WHERE #{quote_column_name(fkcolmn)} IN ( SELECT #{quote_column_name(pkcolmn)} FROM #{quote_table_name(pktable)} )"
+            end
+          end
+          if options[:if_exists] && @version_year < 2016
+            execute "IF EXISTS(SELECT * FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = #{quote(table_name)}) DROP TABLE #{quote_table_name(table_name)}"
+          else
+            super
+          end
+        end
+
+        def indexes(table_name)
+          data = select("EXEC sp_helpindex #{quote(table_name)}", "SCHEMA") rescue []
+
           data.reduce([]) do |indexes, index|
             index = index.with_indifferent_access
+
             if index[:index_description] =~ /primary key/
               indexes
             else
               name    = index[:index_name]
               unique  = index[:index_description] =~ /unique/
               where   = select_value("SELECT [filter_definition] FROM sys.indexes WHERE name = #{quote(name)}")
-              columns = index[:index_keys].split(',').map do |column|
+              orders  = {}
+              columns = []
+
+              index[:index_keys].split(',').each do |column|
                 column.strip!
-                column.gsub! '(-)', '' if column.ends_with?('(-)')
-                column
+
+                if column.ends_with?('(-)')
+                  column.gsub! '(-)', ''
+                  orders[column] = :desc
+                end
+
+                columns << column
               end
-              indexes << IndexDefinition.new(table_name, name, unique, columns, nil, nil, where)
+
+              indexes << IndexDefinition.new(table_name, name, unique, columns, where: where, orders: orders)
             end
           end
         end
@@ -95,8 +96,32 @@ module ActiveRecord
         end
 
         def primary_keys(table_name)
-          primaries = schema_cache.columns(table_name).select(&:is_primary?).map(&:name)
+          primaries = primary_keys_select(table_name)
           primaries.present? ? primaries : identity_columns(table_name).map(&:name)
+        end
+
+        def primary_keys_select(table_name)
+          identifier = database_prefix_identifier(table_name)
+          database = identifier.fully_qualified_database_quoted
+          sql = %{
+            SELECT KCU.COLUMN_NAME AS [name]
+            FROM #{database}.INFORMATION_SCHEMA.KEY_COLUMN_USAGE AS KCU
+            LEFT OUTER JOIN #{database}.INFORMATION_SCHEMA.TABLE_CONSTRAINTS AS TC
+              ON KCU.CONSTRAINT_NAME = TC.CONSTRAINT_NAME
+              AND KCU.CONSTRAINT_NAME = TC.CONSTRAINT_NAME
+              AND KCU.CONSTRAINT_CATALOG = TC.CONSTRAINT_CATALOG
+              AND KCU.CONSTRAINT_SCHEMA = TC.CONSTRAINT_SCHEMA
+              AND TC.CONSTRAINT_TYPE = N'PRIMARY KEY'
+            WHERE KCU.TABLE_NAME = #{prepared_statements ? '@0' : quote(identifier.object)}
+            AND KCU.TABLE_SCHEMA = #{identifier.schema.blank? ? 'schema_name()' : (prepared_statements ? '@1' : quote(identifier.schema))}
+            AND TC.CONSTRAINT_TYPE = N'PRIMARY KEY'
+            ORDER BY KCU.ORDINAL_POSITION ASC
+          }.gsub(/[[:space:]]/, ' ')
+          binds = []
+          nv128 = SQLServer::Type::UnicodeVarchar.new limit: 128
+          binds << Relation::QueryAttribute.new('TABLE_NAME', identifier.object, nv128)
+          binds << Relation::QueryAttribute.new('TABLE_SCHEMA', identifier.schema, nv128) unless identifier.schema.blank?
+          sp_executesql(sql, 'SCHEMA', binds).map { |r| r['name'] }
         end
 
         def rename_table(table_name, new_name)
@@ -122,9 +147,11 @@ module ActiveRecord
             remove_indexes(table_name, column_name)
           end
           sql_commands << "UPDATE #{quote_table_name(table_name)} SET #{quote_column_name(column_name)}=#{quote_default_expression(options[:default], column_object)} WHERE #{quote_column_name(column_name)} IS NULL" if !options[:null].nil? && options[:null] == false && !options[:default].nil?
-          sql_commands << "ALTER TABLE #{quote_table_name(table_name)} ALTER COLUMN #{quote_column_name(column_name)} #{type_to_sql(type, options[:limit], options[:precision], options[:scale])}"
-          sql_commands[-1] << ' NOT NULL' if !options[:null].nil? && options[:null] == false
-          if options_include_default?(options)
+          sql_commands << "ALTER TABLE #{quote_table_name(table_name)} ALTER COLUMN #{quote_column_name(column_name)} #{type_to_sql(type, limit: options[:limit], precision: options[:precision], scale: options[:scale])}"
+          sql_commands.last << ' NOT NULL' if !options[:null].nil? && options[:null] == false
+          if options.key?(:default) && default_constraint_name(table_name, column_name).present?
+            change_column_default(table_name, column_name, options[:default])
+          elsif options_include_default?(options)
             sql_commands << "ALTER TABLE #{quote_table_name(table_name)} ADD CONSTRAINT #{default_constraint_name(table_name, column_name)} DEFAULT #{quote_default_expression(options[:default], column_object)} FOR #{quote_column_name(column_name)}"
           end
           # Add any removed indexes back
@@ -132,6 +159,7 @@ module ActiveRecord
             sql_commands << "CREATE INDEX #{quote_table_name(index.name)} ON #{quote_table_name(table_name)} (#{index.columns.map { |c| quote_column_name(c) }.join(', ')})"
           end
           sql_commands.each { |c| do_execute(c) }
+          clear_cache!
         end
 
         def change_column_default(table_name, column_name, default_or_changes)
@@ -146,7 +174,6 @@ module ActiveRecord
 
         def rename_column(table_name, column_name, new_column_name)
           clear_cache!
-          detect_column_for! table_name, column_name
           identifier = SQLServer::Utils.extract_identifiers("#{table_name}.#{column_name}")
           execute_procedure :sp_rename, identifier.quoted, new_column_name, 'COLUMN'
           rename_column_indexes(table_name, column_name, new_column_name)
@@ -187,7 +214,7 @@ module ActiveRecord
           end
         end
 
-        def type_to_sql(type, limit = nil, precision = nil, scale = nil)
+        def type_to_sql(type, limit: nil, precision: nil, scale: nil, **)
           type_limitable = %w(string integer float char nchar varchar nvarchar).include?(type.to_s)
           limit = nil unless type_limitable
           case type.to_s
@@ -219,7 +246,8 @@ module ActiveRecord
               s.gsub(/\s+(?:ASC|DESC)\b/i, '')
                .gsub(/\s+NULLS\s+(?:FIRST|LAST)\b/i, '')
             }.reject(&:blank?).map.with_index { |column, i| "#{column} AS alias_#{i}" }
-          [super, *order_columns].join(', ')
+
+          (order_columns << super).join(", ")
         end
 
         def update_table_definition(table_name, base)
@@ -233,19 +261,45 @@ module ActiveRecord
           if !allow_null.nil? && allow_null == false && !default.nil?
             do_execute("UPDATE #{table_id} SET #{column_id}=#{quote(default)} WHERE #{column_id} IS NULL")
           end
-          sql = "ALTER TABLE #{table_id} ALTER COLUMN #{column_id} #{type_to_sql column.type, column.limit, column.precision, column.scale}"
+          sql = "ALTER TABLE #{table_id} ALTER COLUMN #{column_id} #{type_to_sql column.type, limit: column.limit, precision: column.precision, scale: column.scale}"
           sql << ' NOT NULL' if !allow_null.nil? && allow_null == false
           do_execute sql
         end
 
+        def create_schema_dumper(options)
+          SQLServer::SchemaDumper.create(self, options)
+        end
 
-        protected
+        private
+
+        def data_source_sql(name = nil, type: nil)
+          scope = quoted_scope name, type: type
+          table_name = lowercase_schema_reflection_sql 'TABLE_NAME'
+          sql = "SELECT #{table_name}"
+          sql << ' FROM INFORMATION_SCHEMA.TABLES WITH (NOLOCK)'
+          sql << ' WHERE TABLE_CATALOG = DB_NAME()'
+          sql << " AND TABLE_SCHEMA = #{quote(scope[:schema])}"
+          sql << " AND TABLE_NAME = #{quote(scope[:name])}" if scope[:name]
+          sql << " AND TABLE_TYPE = #{quote(scope[:type])}" if scope[:type]
+          sql << " ORDER BY #{table_name}"
+          sql
+        end
+
+        def quoted_scope(name = nil, type: nil)
+          identifier = SQLServer::Utils.extract_identifiers(name)
+          {}.tap do |scope|
+            scope[:schema] = identifier.schema || 'dbo'
+            scope[:name] = identifier.object if identifier.object
+            scope[:type] = type if type
+          end
+        end
 
         # === SQLServer Specific ======================================== #
 
         def initialize_native_database_types
           {
-            primary_key: 'int NOT NULL IDENTITY(1,1) PRIMARY KEY',
+            primary_key: 'bigint NOT NULL IDENTITY(1,1) PRIMARY KEY',
+            primary_key_nonclustered: 'int NOT NULL IDENTITY(1,1) PRIMARY KEY NONCLUSTERED',
             integer: { name: 'int', limit: 4 },
             bigint: { name: 'bigint' },
             boolean: { name: 'bit' },
@@ -273,22 +327,13 @@ module ActiveRecord
             varbinary: { name: 'varbinary', limit: 8000 },
             binary: { name: 'varbinary(max)' },
             uuid: { name: 'uniqueidentifier' },
-            ss_timestamp: { name: 'timestamp' }
+            ss_timestamp: { name: 'timestamp' },
+            json: { name: 'nvarchar(max)' }
           }
         end
 
-        def tables_sql(type)
-          tn  = lowercase_schema_reflection_sql 'TABLE_NAME'
-          sql = "SELECT #{tn} FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE = '#{type}' ORDER BY TABLE_NAME"
-          select_values sql, 'SCHEMA'
-        end
-
         def column_definitions(table_name)
-          identifier = if database_prefix_remote_server?
-            SQLServer::Utils.extract_identifiers("#{database_prefix}#{table_name}")
-          else
-            SQLServer::Utils.extract_identifiers(table_name)
-          end
+          identifier  = database_prefix_identifier(table_name)
           database    = identifier.fully_qualified_database_quoted
           view_exists = view_exists?(table_name)
           view_tblnm  = view_table_name(table_name) if view_exists
@@ -319,6 +364,7 @@ module ActiveRecord
             FROM #{database}.INFORMATION_SCHEMA.COLUMNS columns
             LEFT OUTER JOIN #{database}.INFORMATION_SCHEMA.TABLE_CONSTRAINTS AS TC
               ON TC.TABLE_NAME = columns.TABLE_NAME
+              AND TC.TABLE_SCHEMA = columns.TABLE_SCHEMA
               AND TC.CONSTRAINT_TYPE = N'PRIMARY KEY'
             LEFT OUTER JOIN #{database}.INFORMATION_SCHEMA.KEY_COLUMN_USAGE AS KCU
               ON KCU.COLUMN_NAME = columns.COLUMN_NAME
@@ -462,20 +508,23 @@ module ActiveRecord
         end
 
         def view_information(table_name)
-          identifier = SQLServer::Utils.extract_identifiers(table_name)
-          view_info = select_one "SELECT * FROM INFORMATION_SCHEMA.VIEWS WHERE TABLE_NAME = '#{identifier.object}'", 'SCHEMA'
-          if view_info
-            view_info = view_info.with_indifferent_access
-            if view_info[:VIEW_DEFINITION].blank? || view_info[:VIEW_DEFINITION].length == 4000
-              view_info[:VIEW_DEFINITION] = begin
-                select_values("EXEC sp_helptext #{identifier.object_quoted}", 'SCHEMA').join
-              rescue
-                warn "No view definition found, possible permissions problem.\nPlease run GRANT VIEW DEFINITION TO your_user;"
-                nil
+          @view_information ||= {}
+          @view_information[table_name] ||= begin
+            identifier = SQLServer::Utils.extract_identifiers(table_name)
+            view_info = select_one "SELECT * FROM INFORMATION_SCHEMA.VIEWS WITH (NOLOCK) WHERE TABLE_NAME = #{quote(identifier.object)}", 'SCHEMA'
+            if view_info
+              view_info = view_info.with_indifferent_access
+              if view_info[:VIEW_DEFINITION].blank? || view_info[:VIEW_DEFINITION].length == 4000
+                view_info[:VIEW_DEFINITION] = begin
+                  select_values("EXEC sp_helptext #{identifier.object_quoted}", 'SCHEMA').join
+                rescue
+                  warn "No view definition found, possible permissions problem.\nPlease run GRANT VIEW DEFINITION TO your_user;"
+                  nil
+                end
               end
             end
+            view_info
           end
-          view_info
         end
 
         def views_real_column_name(table_name, column_name)
@@ -484,29 +533,6 @@ module ActiveRecord
           match_data = view_definition.match(/([\w-]*)\s+as\s+#{column_name}/im)
           match_data ? match_data[1] : column_name
         end
-
-        # === SQLServer Specific (Identity Inserts) ===================== #
-
-        def query_requires_identity_insert?(sql)
-          if insert_sql?(sql)
-            table_name = get_table_name(sql)
-            id_column = identity_columns(table_name).first
-            id_column && sql =~ /^\s*(INSERT|EXEC sp_executesql N'INSERT)[^(]+\([^)]*\b(#{id_column.name})\b,?[^)]*\)/i ? quote_table_name(table_name) : false
-          else
-            false
-          end
-        end
-
-        def insert_sql?(sql)
-          !(sql =~ /^\s*(INSERT|EXEC sp_executesql N'INSERT)/i).nil?
-        end
-
-        def identity_columns(table_name)
-          columns(table_name).select(&:is_identity?)
-        end
-
-
-        private
 
         def create_table_definition(*args)
           SQLServer::TableDefinition.new(*args)

@@ -3,10 +3,6 @@ module ActiveRecord
     module SQLServer
       module DatabaseStatements
 
-        def select_rows(sql, name = nil, binds = [])
-          sp_executesql sql, name, binds, fetch: :rows
-        end
-
         def execute(sql, name = nil)
           if id_insert_table_name = query_requires_identity_insert?(sql)
             with_identity_insert_enabled(id_insert_table_name) { do_execute(sql, name) }
@@ -19,26 +15,22 @@ module ActiveRecord
           sp_executesql(sql, name, binds, prepare: prepare)
         end
 
-        def exec_insert(sql, name, binds, pk = nil, _sequence_name = nil)
-          if pk && id_insert_table_name = query_requires_identity_insert?(sql)
-            with_identity_insert_enabled(id_insert_table_name) { exec_query(sql, name, binds) }
+        def exec_insert(sql, name = nil, binds = [], pk = nil, _sequence_name = nil)
+          if id_insert_table_name = exec_insert_requires_identity?(sql, pk, binds)
+            with_identity_insert_enabled(id_insert_table_name) { super(sql, name, binds, pk) }
           else
-            exec_query(sql, name, binds)
+            super(sql, name, binds, pk)
           end
         end
 
         def exec_delete(sql, name, binds)
-          sql << '; SELECT @@ROWCOUNT AS AffectedRows'
-          super.rows.first.first
+          sql = sql.dup << '; SELECT @@ROWCOUNT AS AffectedRows'
+          super(sql, name, binds).rows.first.first
         end
 
         def exec_update(sql, name, binds)
-          sql << '; SELECT @@ROWCOUNT AS AffectedRows'
-          super.rows.first.first
-        end
-
-        def supports_statement_cache?
-          true
+          sql = sql.dup << '; SELECT @@ROWCOUNT AS AffectedRows'
+          super(sql, name, binds).rows.first.first
         end
 
         def begin_db_transaction
@@ -80,17 +72,32 @@ module ActiveRecord
         end
 
         def case_sensitive_comparison(table, attribute, column, value)
-          if value && value.acts_like?(:string)
-            table[attribute].eq(Arel::Nodes::Bin.new(Arel::Nodes::BindParam.new))
+          if column.collation && !column.case_sensitive?
+            table[attribute].eq(Arel::Nodes::Bin.new(value))
           else
             super
           end
         end
 
         def can_perform_case_insensitive_comparison_for?(column)
-          column.type == :string
+          column.type == :string && (!column.collation || column.case_sensitive?)
         end
         private :can_perform_case_insensitive_comparison_for?
+
+        def combine_multi_statements(total_sql)
+          total_sql
+        end
+        private :combine_multi_statements
+
+        def default_insert_value(column)
+          if column.is_identity?
+            table_name = quote(quote_table_name(column.table_name))
+            Arel.sql("IDENT_CURRENT(#{table_name}) + IDENT_INCR(#{table_name})")
+          else
+            super
+          end
+        end
+        private :default_insert_value
 
         # === SQLServer Specific ======================================== #
 
@@ -132,7 +139,9 @@ module ActiveRecord
 
         def user_options
           return {} if sqlserver_azure?
-          select_rows('dbcc useroptions', 'SCHEMA').reduce(HashWithIndifferentAccess.new) do |values, row|
+          rows = select_rows('DBCC USEROPTIONS WITH NO_INFOMSGS', 'SCHEMA')
+          rows = rows.first if rows.size == 2 && rows.last.empty?
+          rows.reduce(HashWithIndifferentAccess.new) do |values, row|
             if row.instance_of? Hash
               set_option = row.values[0].gsub(/\s+/, '_')
               user_value = row.values[1]
@@ -194,9 +203,19 @@ module ActiveRecord
             table_name = query_requires_identity_insert?(sql)
             pk = primary_key(table_name)
           end
-          sql = if pk && self.class.use_output_inserted && !database_prefix_remote_server?
+          sql = if pk && use_output_inserted? && !database_prefix_remote_server?
                   quoted_pk = SQLServer::Utils.extract_identifiers(pk).quoted
-                  sql.insert sql.index(/ (DEFAULT )?VALUES/), " OUTPUT INSERTED.#{quoted_pk}"
+                  exclude_output_inserted = exclude_output_inserted_table_name?(table_name, sql)
+                  if exclude_output_inserted
+                    id_sql_type = exclude_output_inserted.is_a?(TrueClass) ? 'bigint' : exclude_output_inserted
+                    <<-SQL.strip_heredoc
+                      DECLARE @ssaIdInsertTable table (#{quoted_pk} #{id_sql_type});
+                      #{sql.dup.insert sql.index(/ (DEFAULT )?VALUES/), " OUTPUT INSERTED.#{quoted_pk} INTO @ssaIdInsertTable"}
+                      SELECT CAST(#{quoted_pk} AS #{id_sql_type}) FROM @ssaIdInsertTable
+                    SQL
+                  else
+                    sql.dup.insert sql.index(/ (DEFAULT )?VALUES/), " OUTPUT INSERTED.#{quoted_pk}"
+                  end
                 else
                   "#{sql}; SELECT CAST(SCOPE_IDENTITY() AS bigint) AS Ident"
                 end
@@ -229,6 +248,8 @@ module ActiveRecord
         def sp_executesql_types_and_parameters(binds)
           types, params = [], []
           binds.each_with_index do |attr, index|
+            attr = attr.value if attr.is_a?(Arel::Nodes::BindParam)
+
             types << "@#{index} #{sp_executesql_sql_type(attr)}"
             params << sp_executesql_sql_param(attr)
           end
@@ -239,21 +260,19 @@ module ActiveRecord
           return attr.type.sqlserver_type if attr.type.respond_to?(:sqlserver_type)
           case value = attr.value_for_database
           when Numeric
-            'int'.freeze
-          when String
-            'nvarchar(max)'.freeze
+            value > 2_147_483_647 ? 'bigint'.freeze : 'int'.freeze
           else
-            raise TypeError, "sp_executesql_sql_type can not find sql type for attr #{attr.inspect}"
+            'nvarchar(max)'.freeze
           end
         end
 
         def sp_executesql_sql_param(attr)
-          case attr.value_for_database
+          case value = attr.value_for_database
           when Type::Binary::Data,
                ActiveRecord::Type::SQLServer::Data
-            quote(attr.value_for_database)
+            quote(value)
           else
-            quote(type_cast(attr.value_for_database))
+            quote(type_cast(value))
           end
         end
 
@@ -261,7 +280,7 @@ module ActiveRecord
           if name == 'EXPLAIN'
             params.each.with_index do |param, index|
               substitute_at_finder = /(@#{index})(?=(?:[^']|'[^']*')*$)/ # Finds unquoted @n values.
-              sql.sub! substitute_at_finder, param.to_s
+              sql = sql.sub substitute_at_finder, param.to_s
             end
           else
             types = quote(types.join(', '))
@@ -279,6 +298,46 @@ module ActiveRecord
           end
         ensure
           @update_sql = false
+        end
+
+        # === SQLServer Specific (Identity Inserts) ===================== #
+
+        def use_output_inserted?
+          self.class.use_output_inserted
+        end
+
+        def exclude_output_inserted_table_names?
+          !self.class.exclude_output_inserted_table_names.empty?
+        end
+
+        def exclude_output_inserted_table_name?(table_name, sql)
+          return false unless exclude_output_inserted_table_names?
+          table_name ||= get_table_name(sql)
+          return false unless table_name
+          self.class.exclude_output_inserted_table_names[table_name]
+        end
+
+        def exec_insert_requires_identity?(sql, pk, binds)
+          query_requires_identity_insert?(sql)
+        end
+
+        def query_requires_identity_insert?(sql)
+          if insert_sql?(sql)
+            table_name = get_table_name(sql)
+            id_column = identity_columns(table_name).first
+            # id_column && sql =~ /^\s*(INSERT|EXEC sp_executesql N'INSERT)[^(]+\([^)]*\b(#{id_column.name})\b,?[^)]*\)/i ? quote_table_name(table_name) : false
+            id_column && sql =~ /^\s*(INSERT|EXEC sp_executesql N'INSERT)[^(]+\([^)]*\b(#{id_column.name})\b,?[^)]*\)/i ? table_name : false
+          else
+            false
+          end
+        end
+
+        def insert_sql?(sql)
+          !(sql =~ /^\s*(INSERT|EXEC sp_executesql N'INSERT)/i).nil?
+        end
+
+        def identity_columns(table_name)
+          schema_cache.columns(table_name).select(&:is_identity?)
         end
 
         # === SQLServer Specific (Selecting) ============================ #

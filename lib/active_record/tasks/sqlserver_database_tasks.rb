@@ -48,10 +48,12 @@ module ActiveRecord
         create true
       end
 
-      def structure_dump(filename)
+      def structure_dump(filename, extra_flags)
+        server_arg = "-S #{Shellwords.escape(configuration['host'])}"
+        server_arg += ":#{Shellwords.escape(configuration['port'])}" if configuration['port']
         command = [
-          "defncopy",
-          "-S #{Shellwords.escape(configuration['host'])}",
+          "defncopy-ttds",
+          server_arg,
           "-D #{Shellwords.escape(configuration['database'])}",
           "-U #{Shellwords.escape(configuration['username'])}",
           "-P #{Shellwords.escape(configuration['password'])}",
@@ -71,7 +73,7 @@ module ActiveRecord
         File.open(filename, "w") { |file| file.puts dump }
       end
 
-      def structure_load(filename)
+      def structure_load(filename, extra_flags)
         connection.execute File.read(filename)
       end
 

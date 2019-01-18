@@ -1,24 +1,54 @@
-
-## v5.0.0
+## v5.1.6
 
 #### Added
 
-* Support for `supports_datetime_with_precision`.
-* Support for `unprepared_statement` blocks on the connection.
+* Use lock hint when joining table in query.
 
-#### Changed
 
-* Major refactoring of all type objects. Especially time types.
-
-#### Deprecated
-
-* Support for a handful of standard Rails deprecations in 5-0-stable suite.
-
-#### Removed
-
-* ODBC connection mode. Not been maintained since Rails 4.0.
-* View table name detection in `with_identity_insert_enabled` method for fixtures. Perf hit.
+## v5.1.5
 
 #### Fixed
 
-* Do not output column collation in schema when same as database.
+* Memoize `@@version` queries. Fixes #632
+
+
+## v5.1.4
+
+#### Fixed
+
+* Add case insensitive comparison for better performance with CI collations. Fixes #624
+
+
+## v5.1.3
+
+#### Fixed
+
+* Use bigint type in sqlserver_type when needed. Fixes #616
+
+
+## v5.1.2
+
+#### Fixed
+
+* The `fast_string_to_time` method when zone local. Fixes #609 #614 #620
+* Patched `Relation#build_count_subquery`. Fixes #613.
+* Inserts to tables with triggers using default `OUTPUT INSERTED` style. Fixes #595.
+
+
+## v5.1.1
+
+#### Fixed
+
+* Use `ActiveSupport.on_load` to hook into ActiveRecord Fixes #588 #598
+
+
+## v5.1.0
+
+#### Changed
+
+* The `drop_table` with force cascade option now mimics in via pure SQL for us.
+
+#### Added
+
+* Support MismatchedForeignKey exception.
+

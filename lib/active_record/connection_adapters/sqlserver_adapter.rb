@@ -3,6 +3,7 @@ require 'active_record'
 require 'arel_sqlserver'
 require 'active_record/connection_adapters/abstract_adapter'
 require 'active_record/connection_adapters/sqlserver/core_ext/active_record'
+require 'active_record/connection_adapters/sqlserver/core_ext/calculations'
 require 'active_record/connection_adapters/sqlserver/core_ext/explain'
 require 'active_record/connection_adapters/sqlserver/core_ext/explain_subscriber'
 require 'active_record/connection_adapters/sqlserver/core_ext/attribute_methods'
@@ -33,7 +34,6 @@ module ActiveRecord
               SQLServer::Quoting,
               SQLServer::DatabaseStatements,
               SQLServer::Showplan,
-              SQLServer::SchemaDumper,
               SQLServer::SchemaStatements,
               SQLServer::DatabaseLimits,
               SQLServer::DatabaseTasks
@@ -44,11 +44,13 @@ module ActiveRecord
 
       cattr_accessor :cs_equality_operator, instance_accessor: false
       cattr_accessor :use_output_inserted, instance_accessor: false
+      cattr_accessor :exclude_output_inserted_table_names, instance_accessor: false
       cattr_accessor :showplan_option, instance_accessor: false
       cattr_accessor :lowercase_schema_reflection
 
       self.cs_equality_operator = 'COLLATE Latin1_General_CS_AS_WS'
       self.use_output_inserted = true
+      self.exclude_output_inserted_table_names = Concurrent::Map.new { false }
 
       def initialize(connection, logger = nil, config = {})
         super(connection, logger, config)
@@ -73,14 +75,6 @@ module ActiveRecord
         SQLServer::SchemaCreation.new self
       end
 
-      def supports_migrations?
-        true
-      end
-
-      def supports_primary_key?
-        true
-      end
-
       def supports_ddl_transactions?
         true
       end
@@ -95,10 +89,6 @@ module ActiveRecord
 
       def supports_index_sort_order?
         true
-      end
-
-      def supports_index_sort_order?
-        false
       end
 
       def supports_partial_index?
@@ -134,7 +124,7 @@ module ActiveRecord
       end
 
       def supports_json?
-        true
+        @version_year >= 2016
       end
 
       def supports_comments?
@@ -145,12 +135,16 @@ module ActiveRecord
         false
       end
 
+      def supports_in_memory_oltp?
+        @version_year >= 2014
+      end
+
       def disable_referential_integrity
         tables = tables_with_referential_integrity
-        tables.each { |t| do_execute "ALTER TABLE #{t} NOCHECK CONSTRAINT ALL" }
+        tables.each { |t| do_execute "ALTER TABLE #{quote_table_name(t)} NOCHECK CONSTRAINT ALL" }
         yield
       ensure
-        tables.each { |t| do_execute "ALTER TABLE #{t} CHECK CONSTRAINT ALL" }
+        tables.each { |t| do_execute "ALTER TABLE #{quote_table_name(t)} CHECK CONSTRAINT ALL" }
       end
 
       # === Abstract Adapter (Connection Management) ================== #
@@ -176,12 +170,13 @@ module ActiveRecord
           @connection.close rescue nil
         end
         @connection = nil
+        @spid = nil
+        @collation = nil
       end
 
       def clear_cache!
+        @view_information = nil
         super
-        @spid = nil
-        @collation = nil
       end
 
       def reset!
@@ -193,7 +188,7 @@ module ActiveRecord
 
       def tables_with_referential_integrity
         schemas_and_tables = select_rows <<-SQL.strip_heredoc
-          SELECT s.name, o.name
+          SELECT DISTINCT s.name, o.name
           FROM sys.foreign_keys i
           INNER JOIN sys.objects o ON i.parent_object_id = o.OBJECT_ID
           INNER JOIN sys.schemas s ON o.schema_id = s.schema_id
@@ -229,6 +224,14 @@ module ActiveRecord
         @connection_options[:database_prefix]
       end
 
+      def database_prefix_identifier(name)
+        if database_prefix_remote_server?
+          SQLServer::Utils.extract_identifiers("#{database_prefix}#{name}")
+        else
+          SQLServer::Utils.extract_identifiers(name)
+        end
+      end
+
       def version
         self.class::VERSION
       end
@@ -249,7 +252,7 @@ module ActiveRecord
 
       # === Abstract Adapter (Misc Support) =========================== #
 
-      def initialize_type_map(m)
+      def initialize_type_map(m = type_map)
         m.register_type              %r{.*},            SQLServer::Type::UnicodeString.new
         # Exact Numerics
         register_class_with_limit m, 'bigint(8)',         SQLServer::Type::BigInteger
@@ -303,6 +306,7 @@ module ActiveRecord
         register_class_with_limit m, %r{\Anvarchar}i,     SQLServer::Type::UnicodeVarchar
         m.alias_type                 'string',            'nvarchar(4000)'
         m.register_type              'nvarchar(max)',     SQLServer::Type::UnicodeVarcharMax.new
+        m.register_type              'nvarchar(max)',     SQLServer::Type::UnicodeVarcharMax.new
         m.register_type              'ntext',             SQLServer::Type::UnicodeText.new
         # Binary Strings
         register_class_with_limit m, %r{\Abinary}i,       SQLServer::Type::Binary
@@ -325,6 +329,20 @@ module ActiveRecord
           NoDatabaseError.new(message)
         when /data would be truncated/
           ValueTooLong.new(message)
+        when /Column '(.*)' is not the same data type as referencing column '(.*)' in foreign key/
+          pk_id, fk_id = SQLServer::Utils.extract_identifiers($1), SQLServer::Utils.extract_identifiers($2)
+          MismatchedForeignKey.new(
+            self,
+            message: message,
+            table: fk_id.schema,
+            foreign_key: fk_id.object,
+            target_table: pk_id.schema,
+            primary_key: pk_id.object
+          )
+        when /Cannot insert the value NULL into column.*does not allow nulls/
+          NotNullViolation.new(message)
+        when /Arithmetic overflow error/
+          RangeError.new(message)
         else
           super
         end
@@ -339,6 +357,7 @@ module ActiveRecord
                         dblib_connect(config)
                       end
         @spid = _raw_select('SELECT @@SPID', fetch: :rows).first.first
+        @version_year = version_year
         configure_connection
       end
 
@@ -356,26 +375,25 @@ module ActiveRecord
           username: config[:username],
           password: config[:password],
           database: config[:database],
-          tds_version: config[:tds_version],
+          tds_version: config[:tds_version] || '7.3',
           appname: config_appname(config),
           login_timeout: config_login_timeout(config),
           timeout: config_timeout(config),
           encoding:  config_encoding(config),
-          azure: config[:azure]
+          azure: config[:azure],
+          contained: config[:contained]
         ).tap do |client|
           if config[:azure]
             client.execute('SET ANSI_NULLS ON').do
-            client.execute('SET CURSOR_CLOSE_ON_COMMIT OFF').do
             client.execute('SET ANSI_NULL_DFLT_ON ON').do
-            client.execute('SET IMPLICIT_TRANSACTIONS OFF').do
             client.execute('SET ANSI_PADDING ON').do
-            client.execute('SET QUOTED_IDENTIFIER ON').do
             client.execute('SET ANSI_WARNINGS ON').do
           else
             client.execute('SET ANSI_DEFAULTS ON').do
-            client.execute('SET CURSOR_CLOSE_ON_COMMIT OFF').do
-            client.execute('SET IMPLICIT_TRANSACTIONS OFF').do
           end
+          client.execute('SET QUOTED_IDENTIFIER ON').do
+          client.execute('SET CURSOR_CLOSE_ON_COMMIT OFF').do
+          client.execute('SET IMPLICIT_TRANSACTIONS OFF').do
           client.execute('SET TEXTSIZE 2147483647').do
           client.execute('SET CONCAT_NULL_YIELDS_NULL ON').do
         end
@@ -413,6 +431,17 @@ module ActiveRecord
         ::Time::DATE_FORMATS[:_sqlserver_datetimeoffset] = lambda { |time|
           time.strftime "#{dateformat} %H:%M:%S.%9N #{time.formatted_offset}"
         }
+      end
+
+      def version_year
+        return @version_year if defined?(@version_year)
+        @version_year = begin
+          vstring = _raw_select('SELECT @@version', fetch: :rows).first.first.to_s
+          return 2016 if vstring =~ /vNext/
+          /SQL Server (\d+)/.match(vstring).to_a.last.to_s.to_i
+        rescue Exception => e
+          2016
+        end
       end
 
     end

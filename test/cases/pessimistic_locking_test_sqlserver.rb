@@ -46,21 +46,38 @@ class PessimisticLockingTestSQLServer < ActiveRecord::TestCase
       end
     end
 
-    it 'reload with lock when #lock! called' do
-      assert_nothing_raised do
-        Person.transaction do
-          person = Person.find 1
-          old, person.first_name = person.first_name, 'fooman'
-          person.lock!
-          assert_equal old, person.first_name
-        end
-      end
-    end
-
     it 'can add a custom lock directive' do
       assert_sql %r|SELECT \[people\]\.\* FROM \[people\] WITH\(HOLDLOCK, ROWLOCK\)| do
         Person.lock('WITH(HOLDLOCK, ROWLOCK)').load
       end
+    end
+
+    describe 'joining tables' do
+
+      it 'joined tables use updlock by default' do
+        assert_sql %r|SELECT \[people\]\.\* FROM \[people\] WITH\(UPDLOCK\) INNER JOIN \[readers\] WITH\(UPDLOCK\)\s+ON \[readers\]\.\[person_id\] = \[people\]\.\[id\]| do
+          Person.lock(true).joins(:readers).load
+        end
+      end
+
+      it 'joined tables can use custom lock directive' do
+        assert_sql %r|SELECT \[people\]\.\* FROM \[people\] WITH\(NOLOCK\) INNER JOIN \[readers\] WITH\(NOLOCK\)\s+ON \[readers\]\.\[person_id\] = \[people\]\.\[id\]| do
+          Person.lock('WITH(NOLOCK)').joins(:readers).load
+        end
+      end
+
+      it 'left joined tables use updlock by default' do
+        assert_sql %r|SELECT \[people\]\.\* FROM \[people\] WITH\(UPDLOCK\) LEFT OUTER JOIN \[readers\] WITH\(UPDLOCK\)\s+ON \[readers\]\.\[person_id\] = \[people\]\.\[id\]| do
+          Person.lock(true).left_joins(:readers).load
+        end
+      end
+
+      it 'left joined tables can use custom lock directive' do
+        assert_sql %r|SELECT \[people\]\.\* FROM \[people\] WITH\(NOLOCK\) LEFT OUTER JOIN \[readers\] WITH\(NOLOCK\)\s+ON \[readers\]\.\[person_id\] = \[people\]\.\[id\]| do
+          Person.lock('WITH(NOLOCK)').left_joins(:readers).load
+        end
+      end
+
     end
 
   end
