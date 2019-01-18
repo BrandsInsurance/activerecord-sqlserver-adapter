@@ -5,10 +5,17 @@ module ActiveRecord
       module ColumnMethods
 
         def primary_key(name, type = :primary_key, **options)
-          return super unless type == :uuid
-          options[:default] = options.fetch(:default, 'NEWID()')
-          options[:primary_key] = true
-          column name, type, options
+          if [:integer, :bigint].include?(type)
+            options[:is_identity] = true unless options.key?(:default)
+          elsif type == :uuid
+            options[:default] = options.fetch(:default, 'NEWID()')
+            options[:primary_key] = true
+          end
+          super
+        end
+
+        def primary_key_nonclustered(*args, **options)
+          args.each { |name| column(name, :primary_key_nonclustered, options) }
         end
 
         def real(*args, **options)
@@ -17,6 +24,10 @@ module ActiveRecord
 
         def money(*args, **options)
           args.each { |name| column(name, :money, options) }
+        end
+
+        def smalldatetime(*args, **options)
+          args.each { |name| column(name, :smalldatetime, options) }
         end
 
         def datetime(*args, **options)
@@ -81,14 +92,23 @@ module ActiveRecord
           args.each { |name| column(name, :ss_timestamp, options) }
         end
 
+        def json(*args, **options)
+          args.each { |name| column(name, :text, options) }
+        end
+
       end
 
       class TableDefinition < ActiveRecord::ConnectionAdapters::TableDefinition
         include ColumnMethods
 
-        def new_column_definition(name, type, options)
-          type = :datetime2 if type == :datetime && options[:precision]
-          super name, type, options
+        def new_column_definition(name, type, **options)
+          case type
+          when :datetime
+            type = :datetime2 if options[:precision]
+          when :primary_key
+            options[:is_identity] = true
+          end
+          super
         end
       end
 

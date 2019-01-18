@@ -21,6 +21,7 @@ ActiveRecord::Schema.define do
     # Our type methods.
     t.real           :real_col
     t.money          :money_col
+    t.smalldatetime  :smalldatetime_col
     t.datetime2      :datetime2_col
     t.datetimeoffset :datetimeoffset
     t.smallmoney     :smallmoney_col
@@ -33,9 +34,23 @@ ActiveRecord::Schema.define do
     t.varbinary      :varbinary_col
     t.uuid           :uuid_col
     t.ss_timestamp   :sstimestamp_col
+    if supports_json?
+      t.json :json_col
+    else
+      t.text :json_col
+    end
   end
 
   # Edge Cases
+
+  if ENV['IN_MEMORY_OLTP'] && supports_in_memory_oltp?
+    create_table 'sst_memory', force: true, id: false,
+                 options: 'WITH (MEMORY_OPTIMIZED = ON, DURABILITY = SCHEMA_AND_DATA)' do |t|
+      t.primary_key_nonclustered :id
+      t.string :name
+      t.timestamps
+    end
+  end
 
   create_table 'sst_bookings', force: true do |t|
     t.string :name
@@ -47,10 +62,6 @@ ActiveRecord::Schema.define do
     t.string :name
     t.uuid   :other_uuid, default: 'NEWID()'
     t.uuid   :uuid_nil_default, default: nil
-  end
-
-  create_table '[some.Name]', force: true do |t|
-    t.varchar :name
   end
 
   create_table 'sst_my$strange_table', force: true do |t|
@@ -133,12 +144,20 @@ ActiveRecord::Schema.define do
 
   # Constraints
 
-  create_table(:sst_has_fks, force: true) { |t| t.column(:fk_id, :integer, null: false) }
+  create_table(:sst_has_fks, force: true) do |t|
+    t.column(:fk_id, :bigint, null: false)
+    t.column(:fk_id2, :bigint)
+  end
+
   create_table(:sst_has_pks, force: true) { }
   execute <<-ADDFKSQL
     ALTER TABLE sst_has_fks
     ADD CONSTRAINT FK__sst_has_fks_id
     FOREIGN KEY ([fk_id])
+    REFERENCES [sst_has_pks] ([id]),
+
+    CONSTRAINT FK__sst_has_fks_id2
+    FOREIGN KEY ([fk_id2])
     REFERENCES [sst_has_pks] ([id])
   ADDFKSQL
 
@@ -165,6 +184,44 @@ ActiveRecord::Schema.define do
       /*#{'x'*4000}}*/
       FROM sst_string_defaults
   STRINGDEFAULTSBIGVIEW
+
+  # Trigger
+
+  execute "IF EXISTS(SELECT * FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = 'sst_table_with_trigger') DROP TABLE sst_table_with_trigger"
+  execute "IF EXISTS(SELECT * FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = 'sst_table_with_trigger_history') DROP TABLE sst_table_with_trigger_history"
+  execute <<-SQL
+    CREATE TABLE sst_table_with_trigger(
+      id bigint IDENTITY NOT NULL PRIMARY KEY,
+      event_name nvarchar(255)
+    )
+    CREATE TABLE sst_table_with_trigger_history(
+      id bigint IDENTITY NOT NULL PRIMARY KEY,
+      id_source nvarchar(36),
+      event_name nvarchar(255)
+    )
+  SQL
+  execute <<-SQL
+    CREATE TRIGGER sst_table_with_trigger_t ON sst_table_with_trigger
+    FOR INSERT
+    AS
+    INSERT INTO sst_table_with_trigger_history (id_source, event_name)
+    SELECT id AS id_source, event_name FROM INSERTED
+  SQL
+
+  execute "IF EXISTS(SELECT * FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = 'sst_table_with_uuid_trigger') DROP TABLE sst_table_with_uuid_trigger"
+  execute <<-SQL
+    CREATE TABLE sst_table_with_uuid_trigger(
+      id uniqueidentifier DEFAULT NEWID() PRIMARY KEY,
+      event_name nvarchar(255)
+    )
+  SQL
+  execute <<-SQL
+    CREATE TRIGGER sst_table_with_uuid_trigger_t ON sst_table_with_uuid_trigger
+    FOR INSERT
+    AS
+    INSERT INTO sst_table_with_trigger_history (id_source, event_name)
+    SELECT id AS id_source, event_name FROM INSERTED
+  SQL
 
   # Another schema.
 
@@ -203,5 +260,21 @@ ActiveRecord::Schema.define do
       legacy_id nvarchar(10) NOT NULL PRIMARY KEY,
     )
   NATURALPKTABLESQLINOTHERSCHEMA
+
+  execute "IF EXISTS(SELECT * FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = 'sst_schema_test_mulitple_schema' and TABLE_SCHEMA = 'test') DROP TABLE test.sst_schema_test_mulitple_schema"
+  execute <<-SCHEMATESTMULTIPLESCHEMA
+    CREATE TABLE test.sst_schema_test_mulitple_schema(
+      field_1 int NOT NULL PRIMARY KEY,
+      field_2 int,
+    )
+  SCHEMATESTMULTIPLESCHEMA
+  execute "IF NOT EXISTS(SELECT * FROM sys.schemas WHERE name = 'test2') EXEC sp_executesql N'CREATE SCHEMA test2'"
+  execute "IF EXISTS(SELECT * FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = 'sst_schema_test_mulitple_schema' and TABLE_SCHEMA = 'test2') DROP TABLE test2.sst_schema_test_mulitple_schema"
+  execute <<-SCHEMATESTMULTIPLESCHEMA
+    CREATE TABLE test2.sst_schema_test_mulitple_schema(
+      field_1 int,
+      field_2 int NOT NULL PRIMARY KEY,
+    )
+  SCHEMATESTMULTIPLESCHEMA
 
 end

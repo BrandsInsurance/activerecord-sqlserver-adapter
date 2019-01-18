@@ -9,15 +9,9 @@ class SpecificSchemaTestSQLServer < ActiveRecord::TestCase
     SSTestDollarTableName.limit(20).offset(1)
   end
 
-  it 'handle dot table names' do
-    SSTestDotTableName.create! name: 'test'
-    SSTestDotTableName.limit(20).offset(1)
-    SSTestDotTableName.where(name: 'test').first.must_be :present?
-  end
-
   it 'models can use tinyint pk tables' do
     obj = SSTestTinyintPk.create! name: '1'
-    obj.id.is_a? Fixnum
+    ['Fixnum', 'Integer'].must_include obj.id.class.name
     SSTestTinyintPk.find(obj.id).must_equal obj
   end
 
@@ -163,6 +157,14 @@ class SpecificSchemaTestSQLServer < ActiveRecord::TestCase
     acceptable_uuid = ActiveRecord::ConnectionAdapters::SQLServer::Type::Uuid::ACCEPTABLE_UUID
     db_uuid = ActiveRecord::Base.connection.newid_function
     db_uuid.must_match(acceptable_uuid)
+  end
+
+  # with similar table definition in two schemas
+
+  it 'returns the correct primary columns' do
+    connection = ActiveRecord::Base.connection
+    assert_equal 'field_1', connection.columns('test.sst_schema_test_mulitple_schema').detect(&:is_primary?).name
+    assert_equal 'field_2', connection.columns('test2.sst_schema_test_mulitple_schema').detect(&:is_primary?).name
   end
 
 end

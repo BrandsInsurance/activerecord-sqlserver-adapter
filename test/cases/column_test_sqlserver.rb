@@ -36,7 +36,7 @@ class ColumnTestSQLServer < ActiveRecord::TestCase
     it 'bigint(8)' do
       col = column('bigint')
       col.sql_type.must_equal           'bigint(8)'
-      col.type.must_equal               :bigint
+      col.type.must_equal               :integer
       col.null.must_equal               true
       col.default.must_equal            42
       obj.bigint.must_equal             42
@@ -352,7 +352,7 @@ class ColumnTestSQLServer < ActiveRecord::TestCase
       skip 'datetime2 not supported in this protocal version' unless connection_dblib_73?
       col = column('datetime2_7')
       col.sql_type.must_equal           'datetime2(7)'
-      col.type.must_equal               :datetime2
+      col.type.must_equal               :datetime
       col.null.must_equal               true
       time = Time.utc 9999, 12, 31, 23, 59, 59, Rational(999999900, 1000)
       col.default.must_equal            time, "Nanoseconds were <#{col.default.nsec}> vs <999999900>"
@@ -434,20 +434,26 @@ class ColumnTestSQLServer < ActiveRecord::TestCase
       obj.datetimeoffset_7.must_equal   Time.new(2010, 04, 01, 12, 34, 56, +18000).change(nsec: 123456800), "Nanoseconds were <#{obj.datetimeoffset_7.nsec}> vs <123456800>"
       obj.reload
       obj.datetimeoffset_7.must_equal   Time.new(2010, 04, 01, 12, 34, 56, +18000).change(nsec: 123456800), "Nanoseconds were <#{obj.datetimeoffset_7.nsec}> vs <123456800>"
+      # Maintains the timezone
+      time = ActiveSupport::TimeZone['America/Los_Angeles'].local 2010, 12, 31, 23, 59, 59, Rational(123456800, 1000)
+      obj.datetimeoffset_7 = time
+      obj.datetimeoffset_7.must_equal time
+      obj.save!
+      obj.datetimeoffset_7.must_equal time
+      obj.reload.datetimeoffset_7.must_equal time
       # With other precisions.
       time = ActiveSupport::TimeZone['America/Los_Angeles'].local 2010, 12, 31, 23, 59, 59, Rational(123456755, 1000)
       col = column('datetimeoffset_3')
       connection.lookup_cast_type_from_column(col).precision.must_equal 3
       obj.datetimeoffset_3 = time
       obj.datetimeoffset_3.must_equal time.change(nsec: 123000000), "Nanoseconds were <#{obj.datetimeoffset_3.nsec}> vs <123000000>"
-      # TODO: FreeTDS date bug fixed: https://github.com/FreeTDS/freetds/issues/44
-      obj.save! ; obj.reload
+      obj.save!
       obj.datetimeoffset_3.must_equal time.change(nsec: 123000000), "Nanoseconds were <#{obj.datetimeoffset_3.nsec}> vs <123000000>"
       col = column('datetime2_1')
       connection.lookup_cast_type_from_column(col).precision.must_equal 1
       obj.datetime2_1 = time
       obj.datetime2_1.must_equal time.change(nsec: 100000000), "Nanoseconds were <#{obj.datetime2_1.nsec}> vs <100000000>"
-      obj.save! ; obj.reload
+      obj.save!
       obj.datetime2_1.must_equal time.change(nsec: 100000000), "Nanoseconds were <#{obj.datetime2_1.nsec}> vs <100000000>"
     end
 

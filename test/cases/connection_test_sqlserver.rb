@@ -8,8 +8,10 @@ class ConnectionTestSQLServer < ActiveRecord::TestCase
 
   fixtures :topics, :accounts
 
-  before { assert connection.active? }
-  after  { connection.reconnect! }
+  before do
+    connection.reconnect!
+    assert connection.active?
+  end
 
   it 'affect rows' do
     topic_data = { 1 => { "content" => "1 updated" }, 2 => { "content" => "2 updated" } }
@@ -34,7 +36,7 @@ class ConnectionTestSQLServer < ActiveRecord::TestCase
   describe 'Connection management' do
 
     it 'set spid on connect' do
-      assert_instance_of Fixnum, connection.spid
+      ['Fixnum', 'Integer'].must_include connection.spid.class.name
     end
 
     it 'reset spid on disconnect!' do

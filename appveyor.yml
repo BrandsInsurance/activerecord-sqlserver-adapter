@@ -2,9 +2,7 @@ init:
   - SET PATH=C:\Ruby%ruby_version%\bin;%PATH%
   - SET PATH=C:\MinGW\msys\1.0\bin;%PATH%
   - SET RAKEOPT=-rdevkit
-  - SET TESTOPTS='-v'
-  - SET TINYTDS_VERSION=1.1.0
-  - SET ONLY_SQLSERVER=1
+  - SET TINYTDS_VERSION=2.1.0
 clone_depth: 5
 skip_tags: true
 matrix:
@@ -14,6 +12,8 @@ install:
   - ruby --version
   - gem --version
   - bundle install
+  - gem uninstall bcrypt
+  - gem install bcrypt --platform=ruby
 build: off
 test_script:
   - powershell -File "%APPVEYOR_BUILD_FOLDER%\test\appveyor\dbsetup.ps1"
