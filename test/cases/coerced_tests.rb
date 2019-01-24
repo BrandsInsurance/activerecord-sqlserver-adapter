@@ -151,7 +151,25 @@ module ActiveRecord
 end
 
 
-
+module ActiveRecord
+  class InstrumentationTest < ActiveRecord::TestCase
+    # This fails randomly due to schema cache being lost?
+    coerce_tests! :test_payload_name_on_load
+    def test_payload_name_on_load_coerced
+      Book.create(name: "test book")
+      Book.first
+      subscriber = ActiveSupport::Notifications.subscribe("sql.active_record") do |*args|
+        event = ActiveSupport::Notifications::Event.new(*args)
+        if event.payload[:sql].match "SELECT"
+          assert_equal "Book Load", event.payload[:name]
+        end
+      end
+      Book.first
+    ensure
+      ActiveSupport::Notifications.unsubscribe(subscriber) if subscriber
+    end
+  end
+end
 
 class CalculationsTest < ActiveRecord::TestCase
   # This fails randomly due to schema cache being lost?
@@ -587,6 +605,7 @@ end
 
 
 
+require 'models/parrot'
 require 'models/topic'
 class PersistenceTest < ActiveRecord::TestCase
   # We can not UPDATE identity columns.
@@ -742,6 +761,24 @@ class RelationTest < ActiveRecord::TestCase
   end
 end
 
+class ActiveRecord::RelationTest < ActiveRecord::TestCase
+  coerce_tests! :test_relation_merging_with_merged_symbol_joins_is_aliased
+  def test_relation_merging_with_merged_symbol_joins_is_aliased__coerced
+    categorizations_with_authors = Categorization.joins(:author)
+    queries = capture_sql { Post.joins(:author, :categorizations).merge(Author.select(:id)).merge(categorizations_with_authors).to_a }
+
+    nb_inner_join = queries.sum { |sql| sql.scan(/INNER\s+JOIN/i).size }
+    assert_equal 3, nb_inner_join, "Wrong amount of INNER JOIN in query"
+
+    # using `\W` as the column separator
+    query_matches = queries.any? do |sql|
+      %r[INNER\s+JOIN\s+#{Regexp.escape(Author.quoted_table_name)}\s+\Wauthors_categorizations\W]i.match?(sql)
+    end
+
+    assert query_matches, "Should be aliasing the child INNER JOINs in query"
+  end
+end
+
 
 
 
@@ -894,8 +931,51 @@ class DateTimePrecisionTest < ActiveRecord::TestCase
       end
     end
   end
+
+  # datetime is rounded to increments of .000, .003, or .007 seconds
+  coerce_tests! :test_datetime_precision_is_truncated_on_assignment
+  def test_datetime_precision_is_truncated_on_assignment_coerced
+    @connection.create_table(:foos, force: true)
+    @connection.add_column :foos, :created_at,  :datetime, precision: 0
+    @connection.add_column :foos, :updated_at, :datetime, precision: 6
+
+    time = ::Time.now.change(nsec: 123456789)
+    foo = Foo.new(created_at: time, updated_at: time)
+
+    assert_equal 0, foo.created_at.nsec
+    assert_equal 123457000, foo.updated_at.nsec
+
+    foo.save!
+    foo.reload
+
+    assert_equal 0, foo.created_at.nsec
+    assert_equal 123457000, foo.updated_at.nsec
+  end
 end
 
+
+
+class TimePrecisionTest < ActiveRecord::TestCase
+  # datetime is rounded to increments of .000, .003, or .007 seconds
+  coerce_tests! :test_time_precision_is_truncated_on_assignment
+  def test_time_precision_is_truncated_on_assignment_coerced
+    @connection.create_table(:foos, force: true)
+    @connection.add_column :foos, :start,  :time, precision: 0
+    @connection.add_column :foos, :finish, :time, precision: 6
+
+    time = ::Time.now.change(nsec: 123456789)
+    foo = Foo.new(start: time, finish: time)
+
+    assert_equal 0, foo.start.nsec
+    assert_equal 123457000, foo.finish.nsec
+
+    foo.save!
+    foo.reload
+
+    assert_equal 0, foo.start.nsec
+    assert_equal 123457000, foo.finish.nsec
+  end
+end
 
 
 
@@ -1065,4 +1145,20 @@ class OptimisticLockingTest < ActiveRecord::TestCase
       StringKeyObject.find('record1')
     end
   end
+end
+
+
+
+class RelationMergingTest < ActiveRecord::TestCase
+  coerce_tests! :test_merging_with_order_with_binds
+  def test_merging_with_order_with_binds_coerced
+    relation = Post.all.merge(Post.order([Arel.sql("title LIKE ?"), "%suffix"]))
+    assert_equal ["title LIKE N'%suffix'"], relation.order_values
+  end
+end
+
+
+class EagerLoadingTooManyIdsTest < ActiveRecord::TestCase
+  # Temporarily coerce this test due to https://github.com/rails/rails/issues/34945
+  coerce_tests! :test_eager_loading_too_may_ids
 end
